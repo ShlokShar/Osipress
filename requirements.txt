@@ -12,3 +12,5 @@ gunicorn
 pgvector==0.4.2
 playwright==1.60.0
 persiantools
+qdrant-client
+fastembed==0.7.4

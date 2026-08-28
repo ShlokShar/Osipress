@@ -101,7 +101,7 @@ class HybridSearchTests(unittest.TestCase):
             (shared, 0.2),
         ]
 
-        results = service.hybrid_search("query")
+        results = service.hybrid_search_backup("query")
 
         self.assertEqual(results[0], (1, shared))
         expected_score = 2 / (RRF_K + 2)
@@ -118,7 +118,7 @@ class HybridSearchTests(unittest.TestCase):
         ]
         service.semantic_search = lambda _: []
 
-        results = service.hybrid_search("query")
+        results = service.hybrid_search_backup("query")
 
         self.assertEqual(len(results), 15)
         self.assertTrue(all(

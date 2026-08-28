@@ -125,6 +125,10 @@ class Articles(Base):
         """
         adds an article to the Postgres database.
 
+        The commit expires every attribute, so the article is refreshed while
+        the session is still open. Callers need this to read the id Postgres
+        assigned on insert, which is what keys the article's point in Qdrant.
+
         :param article: the article object (includes the foreign source key)
         :return: the article object
         """
@@ -132,6 +136,9 @@ class Articles(Base):
         with SessionLocal() as session:
             session.add(article)
             session.commit()
+            session.refresh(article)
+
+        return article
 
     def embedding_text(self) -> str:
         """
