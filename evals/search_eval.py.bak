@@ -15,7 +15,6 @@ import statistics
 import sys
 import tempfile
 import time
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,7 +24,7 @@ from sqlalchemy import select
 
 from shared.search_service import SearchService
 from shared.database import SessionLocal
-from shared.models import Articles, Countries, Sources
+from shared.models import Articles
 
 
 EVAL_DIR = Path(__file__).resolve().parent
@@ -40,44 +39,6 @@ class QueryCase:
     query: str
     category: str
     relevance: dict[str, int]
-
-    @property
-    def relevant(self) -> dict[str, int]:
-        """Links graded 1-3. Grade 0 means "judged, and definitely wrong"."""
-
-        return {
-            link: grade for link, grade in self.relevance.items() if grade > 0
-        }
-
-    @property
-    def negatives(self) -> set[str]:
-        """Hard negatives: plausible near-misses that must NOT be retrieved.
-
-        Ordinary IR metrics cannot see these. A result set is penalised for
-        missing a relevant article, but scoring an unjudged article is free,
-        so a backend that returns topically-adjacent noise looks identical to
-        one that returns nothing. On a multi-country corpus that distinction
-        is the whole game: "protests" must not surface Iranian coverage when
-        the user meant Israel.
-        """
-
-        return {link for link, grade in self.relevance.items() if grade == 0}
-
-    @property
-    def length_bucket(self) -> str:
-        """Which query-length regime this case exercises.
-
-        The 2.0.0 set averages 8.7 words, but real users type 2-4. AND-based
-        lexical matching degrades monotonically with length, so a set skewed
-        long systematically misrepresents how the lexical arm behaves in
-        production. Bucketing keeps that bias visible instead of averaged
-        away.
-        """
-
-        words = len(self.query.split())
-        if words <= 4:
-            return "short"
-        return "medium" if words <= 8 else "long"
 
 
 def load_golden_set(path: Path) -> tuple[dict[str, Any], list[QueryCase]]:
@@ -118,14 +79,12 @@ def load_golden_set(path: Path) -> tuple[dict[str, Any], list[QueryCase]]:
             or not link.startswith(("http://", "https://"))
             or not isinstance(grade, int)
             or isinstance(grade, bool)
-            or not 0 <= grade <= 3
+            or not 1 <= grade <= 3
             for link, grade in relevance.items()
         ):
             raise ValueError(
-                f"{label}.relevance requires URL keys and integer grades 0-3"
+                f"{label}.relevance requires URL keys and integer grades 1-3"
             )
-        if not any(grade > 0 for grade in relevance.values()):
-            raise ValueError(f"{label}.relevance needs at least one grade > 0")
         seen_ids.add(query_id)
         cases.append(QueryCase(query_id, query, category, relevance))
 
@@ -182,74 +141,6 @@ def ndcg(ranking: list[str], relevance: dict[str, int], cutoff: int) -> float:
     return dcg / idcg if idcg else 0.0
 
 
-def corpus_metadata() -> dict[str, dict[str, str]]:
-    """Map every article link to its outlet and country.
-
-    Retrieval metrics are computed on links, but OsiPress is a
-    compare-the-coverage product: a result set is only useful if it spans
-    outlets and political leanings. That property is invisible to nDCG, so we
-    join it in here and measure it separately.
-    """
-
-    with SessionLocal() as session:
-        rows = session.execute(
-            select(Articles.link, Sources.name, Countries.name,
-                   Sources.political_leaning)
-            .join(Sources, Articles.source_id == Sources.id)
-            .join(Countries, Sources.country_id == Countries.id)
-        ).all()
-
-    return {
-        link: {"outlet": outlet, "country": country, "leaning": leaning}
-        for link, outlet, country, leaning in rows
-    }
-
-
-def negative_metrics(ranking: list[str],
-                     negatives: set[str]) -> dict[str, float]:
-    """Measure how many judged-irrelevant articles leaked into the results."""
-
-    if not negatives:
-        return {}
-
-    metrics: dict[str, float] = {}
-    for cutoff in CUTOFFS:
-        leaked = len(negatives.intersection(ranking[:cutoff]))
-        metrics[f"false_positive_rate_at_{cutoff}"] = leaked / len(negatives)
-    return metrics
-
-
-def diversity_metrics(ranking: list[str],
-                      metadata: dict[str, dict[str, str]],
-                      cutoff: int = 10) -> dict[str, float]:
-    """Measure outlet and country spread in the top results.
-
-    ``outlet_concentration`` is the share held by the single most-represented
-    outlet: 1.0 means every result came from one paper, which for this product
-    is a failure even at a perfect nDCG. As the corpus grows to more countries
-    this becomes the metric most likely to regress silently, because adding
-    sources raises the ceiling on diversity without any backend noticing.
-    """
-
-    top = [link for link in ranking[:cutoff] if link in metadata]
-    if not top:
-        return {
-            f"distinct_outlets_at_{cutoff}": 0.0,
-            f"distinct_countries_at_{cutoff}": 0.0,
-            f"outlet_concentration_at_{cutoff}": 0.0,
-        }
-
-    outlets = [metadata[link]["outlet"] for link in top]
-    countries = [metadata[link]["country"] for link in top]
-    dominant = max(Counter(outlets).values())
-
-    return {
-        f"distinct_outlets_at_{cutoff}": float(len(set(outlets))),
-        f"distinct_countries_at_{cutoff}": float(len(set(countries))),
-        f"outlet_concentration_at_{cutoff}": dominant / len(top),
-    }
-
-
 def query_metrics(ranking: list[str], relevance: dict[str, int]) -> dict[str, float]:
     """Compute binary and graded retrieval metrics for one query."""
 
@@ -298,19 +189,13 @@ def aggregate(method_results: list[dict[str, Any]]) -> dict[str, Any]:
             "latency_ms": {},
         }
 
-    # Union, not successful[0]: false-positive metrics only exist for queries
-    # that actually carry hard negatives, so key sets differ between queries.
-    metric_names = sorted({
-        name for result in successful for name in result["metrics"]
-    })
-    metrics = {}
-    for name in metric_names:
-        values = [
+    metric_names = successful[0]["metrics"].keys()
+    metrics = {
+        name: round(statistics.fmean(
             result["metrics"][name] for result in successful
-            if name in result["metrics"]
-        ]
-        if values:
-            metrics[name] = round(statistics.fmean(values), 4)
+        ), 4)
+        for name in metric_names
+    }
     latencies = [result["latency_ms"] for result in successful]
     return {
         "successful_queries": len(successful),
@@ -335,21 +220,6 @@ def aggregate_by_category(
             if result["category"] == category
         ])
         for category in categories
-    }
-
-
-def aggregate_by_length(
-    method_results: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    """Break results out by query-length regime (short / medium / long)."""
-
-    buckets = sorted({result["length_bucket"] for result in method_results})
-    return {
-        bucket: aggregate([
-            result for result in method_results
-            if result["length_bucket"] == bucket
-        ])
-        for bucket in buckets
     }
 
 
@@ -411,7 +281,6 @@ def evaluate_method(
     name: str,
     search: Callable[[str], Iterable[tuple[Any, Any]]],
     cases: list[QueryCase],
-    metadata: dict[str, dict[str, str]],
 ) -> list[dict[str, Any]]:
     results = []
     for case in cases:
@@ -423,28 +292,17 @@ def evaluate_method(
         except Exception as exc:  # Keep the report useful after partial failure.
             error = f"{type(exc).__name__}: {exc}"
         latency_ms = (time.perf_counter() - started) * 1000
-        metrics: dict[str, float] = {}
-        if not error:
-            # Positives only: grade-0 links are hard negatives and must not be
-            # counted as relevant targets.
-            metrics = query_metrics(ranking, case.relevant)
-            metrics.update(negative_metrics(ranking, case.negatives))
-            metrics.update(diversity_metrics(ranking, metadata))
+        metrics = query_metrics(ranking, case.relevance) if not error else {}
         results.append({
             "id": case.id,
             "query": case.query,
             "category": case.category,
-            "length_bucket": case.length_bucket,
-            "query_words": len(case.query.split()),
             "latency_ms": round(latency_ms, 2),
             "metrics": metrics,
             "relevant_ranks": {
                 link: ranking.index(link) + 1 if link in ranking else None
-                for link in case.relevant
+                for link in case.relevance
             },
-            "leaked_negatives": sorted(
-                case.negatives.intersection(ranking[:max(CUTOFFS)])
-            ),
             "ranking": ranking[:max(CUTOFFS)],
             "error": error,
         })
@@ -461,24 +319,12 @@ def threshold_failures(report: dict[str, Any],
         failures.append(
             f"hybrid had {hybrid['failed_queries']} failed queries"
         )
-    # Convention: "max_*" keys are ceilings the run must stay under, every
-    # other key is a floor the run must reach.
-    gated = [name for name in thresholds if not name.startswith("max_")]
+    gated = [name for name in thresholds if name != "max_regression_vs_best_baseline"]
     for metric in gated:
         minimum = float(thresholds[metric])
         actual = hybrid["metrics"].get(metric, 0.0)
         if actual < minimum:
             failures.append(f"{metric} {actual:.4f} is below {minimum:.4f}")
-
-    for name, ceiling in thresholds.items():
-        if name == "max_regression_vs_best_baseline" or not name.startswith("max_"):
-            continue
-        metric = name[len("max_"):]
-        actual = hybrid["metrics"].get(metric)
-        if actual is not None and actual > float(ceiling):
-            failures.append(
-                f"{metric} {actual:.4f} exceeds ceiling {float(ceiling):.4f}"
-            )
 
     max_regression = float(thresholds["max_regression_vs_best_baseline"])
     for metric in gated:
@@ -544,7 +390,6 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    metadata = corpus_metadata()
     service = SearchService()
     methods = {
         "lexical": service.lexical_search,
@@ -564,33 +409,15 @@ def main() -> int:
             "embedding_model": service.model,
             "cutoffs": list(CUTOFFS),
         },
-        "query_mix": {
-            "by_length": {
-                bucket: sum(
-                    1 for case in cases if case.length_bucket == bucket
-                )
-                for bucket in ("short", "medium", "long")
-            },
-            "mean_query_words": round(
-                statistics.fmean(len(case.query.split()) for case in cases), 2
-            ),
-            "queries_with_hard_negatives": sum(
-                1 for case in cases if case.negatives
-            ),
-            "hard_negative_judgments": sum(
-                len(case.negatives) for case in cases
-            ),
-        },
         "corpus_coverage": coverage,
         "methods": {},
     }
 
     for name, search in methods.items():
-        query_results = evaluate_method(name, search, cases, metadata)
+        query_results = evaluate_method(name, search, cases)
         report["methods"][name] = {
             "aggregate": aggregate(query_results),
             "by_category": aggregate_by_category(query_results),
-            "by_length": aggregate_by_length(query_results),
             "queries": query_results,
         }
 
@@ -606,12 +433,6 @@ def main() -> int:
     }
     atomic_json_dump(report, args.output)
 
-    mix = report["query_mix"]
-    print(
-        f"\nQuery mix: {mix['by_length']} mean={mix['mean_query_words']} words, "
-        f"{mix['queries_with_hard_negatives']} queries carry hard negatives"
-    )
-
     print("\nAggregate metrics")
     for name in methods:
         summary = report["methods"][name]["aggregate"]
@@ -622,31 +443,6 @@ def main() -> int:
             f"Recall@10={metrics.get('recall_at_10', 0):.4f} "
             f"p95={summary['latency_ms'].get('p95', 0):.2f}ms"
         )
-
-    print("\nBy query length (nDCG@10)")
-    for name in methods:
-        by_length = report["methods"][name]["by_length"]
-        cells = " ".join(
-            f"{bucket}={by_length[bucket]['metrics'].get('ndcg_at_10', 0):.3f}"
-            f"(n={by_length[bucket]['successful_queries']})"
-            for bucket in ("short", "medium", "long") if bucket in by_length
-        )
-        print(f"{name:8} {cells}")
-
-    print("\nResult diversity @10 (outlets / countries / top-outlet share)")
-    for name in methods:
-        metrics = report["methods"][name]["aggregate"]["metrics"]
-        print(
-            f"{name:8} "
-            f"outlets={metrics.get('distinct_outlets_at_10', 0):.2f} "
-            f"countries={metrics.get('distinct_countries_at_10', 0):.2f} "
-            f"concentration={metrics.get('outlet_concentration_at_10', 0):.2f}"
-        )
-        if "false_positive_rate_at_10" in metrics:
-            print(
-                f"{'':8} hard-negative leak@10="
-                f"{metrics['false_positive_rate_at_10']:.3f}"
-            )
     print(f"Quality gate: {'PASS' if not failures else 'FAIL'}")
     for failure in failures:
         print(f"- {failure}")

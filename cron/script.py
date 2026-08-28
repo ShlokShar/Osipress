@@ -18,6 +18,7 @@ from cron.util.article import (
     get_article_content,
     is_safe_article_url
 )
+from cron.util.backfill_vectors import upsert_article
 from cron.util.log import add_log
 from cron.util.translation import (
     translate_references
@@ -337,7 +338,7 @@ def main() -> None:
                 )
 
                 try:
-                    Articles.add_article(article)
+                    article = Articles.add_article(article)
                 except Exception as exception:
                     add_log(
                         f"{country} / {source_name} / {headline}: save failed "
@@ -346,6 +347,18 @@ def main() -> None:
                     continue
 
                 saved_articles += 1
+
+                # Postgres is the source of truth, so a failed upsert is logged
+                # and the article stays saved. It is invisible to search until
+                # the next backfill_vectors() run repairs it.
+                try:
+                    upsert_article(article, vector_service)
+                except Exception as exception:
+                    add_log(
+                        f"{country} / {source_name} / {headline}: Qdrant "
+                        f"upsert failed ({type(exception).__name__}): "
+                        f"{exception}"
+                    )
 
             if saved_articles < MAX_ARTICLES:
                 add_log(
